@@ -1,0 +1,21 @@
+# verify_agent_dataset_access.py
+
+from google.cloud import bigquery
+
+def verify_agent_can_access_required_datasets():
+    """Checks that the agent can access the required BigQuery datasets."""
+    project_id = "your-gcp-project-id"
+    datasets = ["source_data", "sprint"]
+    
+    client = bigquery.Client(project=project_id)
+
+    for dataset in datasets:
+        dataset_id = f"{project_id}.{dataset}"
+        try:
+            client.get_dataset(dataset_id)
+            print(f" Access verified for dataset: {dataset_id}")
+        except Exception as e:
+            print(f" Failed to access dataset: {dataset_id}\nReason: {e}")
+
+if __name__ == "__main__":
+    verify_agent_can_access_required_datasets()
