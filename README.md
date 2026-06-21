@@ -13,6 +13,22 @@ to work across **multiple datasets** in a project.
 > The original Google documentation is preserved below. My changes are summarized
 > here and visible in the commit history.
 
+## Project evolution
+
+This repo is published in two tagged versions so you can see both the original
+working demo and the scalable rewrite:
+
+- **`v0.1-prototype`** — the version used for the demo. Eagerly loads every
+  dataset's schema into the prompt; simple, and works for a handful of datasets.
+- **`v0.2-scalable`** — cached, bulk `INFORMATION_SCHEMA` schema loading with
+  config-driven scope and on-demand retrieval tools (see **Scaling notes**).
+
+Check out a specific version with `git checkout v0.1-prototype` (or
+`v0.2-scalable`), or download either from the repo's **Releases**. The full diff
+between them is the
+[`v0.1-prototype...v0.2-scalable` compare view](https://github.com/<your-username>/bigquery-ai-agent/compare/v0.1-prototype...v0.2-scalable),
+and the rationale is captured in the "Scale schema loading" Pull Request.
+
 ## What I changed
 
 - **Multi-dataset schema discovery.** The original sample loaded the schema for a
@@ -30,6 +46,37 @@ to work across **multiple datasets** in a project.
 
 See the **Scaling notes** section for how the multi-dataset approach evolves for
 large warehouses.
+
+## Scaling notes
+
+The first commit loads the schema of **every** dataset in the project into the
+model's prompt up front (eager schema injection). That works for a handful of
+datasets, but it doesn't scale: the prompt grows linearly with the number of
+tables, which raises token cost and latency and dilutes the model's accuracy
+("lost in the middle"). The original per-table approach also made one
+`list_tables` + `get_table` API call per table and a separate sample query per
+table on **every** turn.
+
+This repo's second commit moves toward bounded, on-demand schema retrieval:
+
+- **Bulk schema fetch.** `_ddl_for_dataset` now pulls all columns of all base
+  tables in a dataset with a single `INFORMATION_SCHEMA` query instead of
+  O(tables) API calls.
+- **Caching.** Per-dataset DDL is cached (`BQ_SCHEMA_CACHE_TTL`), so schema isn't
+  regenerated on every request.
+- **Config-driven scope.** `BQ_DATASET_ID` acts as an allowlist and
+  `BQ_EXCLUDED_DATASETS` as a denylist (replacing the hardcoded skip), so you
+  control exactly how much schema enters context.
+- **Sampling off the hot path.** Example rows are now optional
+  (`BQ_INCLUDE_EXAMPLE_ROWS`, off by default).
+- **On-demand tools.** `list_dataset_tables` and `get_table_schema` let the agent
+  fetch only the schema relevant to the current question instead of preloading
+  everything — the lazy, MCP-style retrieval pattern.
+
+The natural next step for a large warehouse is full dynamic retrieval: expose
+BigQuery as an MCP server (or do embedding-based table selection / RAG over the
+schema) so the model selects the relevant tables per query and the context stays
+roughly constant no matter how big the warehouse is.
 
 ## Acknowledgements
 
