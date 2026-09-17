@@ -18,6 +18,7 @@ import datetime
 import logging
 import os
 import re
+import time
 
 from data_science.utils.utils import get_env_var
 from google.adk.tools import ToolContext
@@ -41,9 +42,23 @@ llm_client = Client(vertexai=True, project=project, location=location)
 
 MAX_NUM_ROWS = 80
 
+# --- Scaling configuration -------------------------------------------------
+# How long a cached dataset schema stays valid (seconds). Schemas change rarely,
+# so caching avoids regenerating DDL (and re-hitting BigQuery) on every turn.
+SCHEMA_CACHE_TTL_SECONDS = int(os.getenv("BQ_SCHEMA_CACHE_TTL", "3600"))
+
+# Including example rows per table makes the model's SQL more accurate, but costs
+# one query per table and bloats the prompt. Off by default; enable for small
+# warehouses via BQ_INCLUDE_EXAMPLE_ROWS=true.
+INCLUDE_EXAMPLE_ROWS = os.getenv("BQ_INCLUDE_EXAMPLE_ROWS", "false").lower() == "true"
+NUM_EXAMPLE_ROWS = int(os.getenv("BQ_NUM_EXAMPLE_ROWS", "3"))
+
 
 database_settings = None
 bq_client = None
+
+# Per-dataset DDL cache: dataset_id -> (timestamp, ddl_string).
+_schema_cache: dict = {}
 
 
 def get_bq_client():
@@ -52,6 +67,31 @@ def get_bq_client():
     if bq_client is None:
         bq_client = bigquery.Client(project=get_env_var("BQ_PROJECT_ID"))
     return bq_client
+
+
+def _get_excluded_datasets():
+    """Datasets to skip, from BQ_EXCLUDED_DATASETS (comma-separated)."""
+    raw = os.getenv("BQ_EXCLUDED_DATASETS", "")
+    return {d.strip() for d in raw.split(",") if d.strip()}
+
+
+def _get_target_datasets(client):
+    """Resolve which datasets the agent should see.
+
+    If BQ_DATASET_ID is set (comma-separated allowlist, or "['a','b']" form) we
+    use exactly those; otherwise we enumerate every dataset in the project.
+    Either way, anything in BQ_EXCLUDED_DATASETS is removed. Using an explicit
+    allowlist is strongly recommended at scale so the model's context stays
+    small and relevant.
+    """
+    excluded = _get_excluded_datasets()
+    allowlist = os.getenv("BQ_DATASET_ID", "").strip()
+    if allowlist:
+        cleaned = allowlist.strip("[]").replace("'", "").replace('"', "")
+        dataset_ids = [d.strip() for d in cleaned.split(",") if d.strip()]
+    else:
+        dataset_ids = [ds.dataset_id for ds in client.list_datasets()]
+    return [d for d in dataset_ids if d not in excluded]
 
 
 def get_database_settings():
@@ -63,18 +103,19 @@ def get_database_settings():
 
 
 def update_database_settings():
-    """Update database settings."""
+    """Update database settings (multi-dataset, cached, bounded)."""
     global database_settings
-    datasets = get_bq_client().list_datasets()
-    dataset_ids = [dataset.dataset_id for dataset in datasets]
-    
+    client = get_bq_client()
+    project_id = get_env_var("BQ_PROJECT_ID")
+    dataset_ids = _get_target_datasets(client)
+
     ddl_schema = get_bigquery_schema(
-        dataset_id = dataset_ids,
-        client=get_bq_client(),
-        project_id=get_env_var("BQ_PROJECT_ID"),
+        dataset_id=dataset_ids,
+        client=client,
+        project_id=project_id,
     )
     database_settings = {
-        "bq_project_id": get_env_var("BQ_PROJECT_ID"),
+        "bq_project_id": project_id,
         "bq_dataset_id": dataset_ids,
         "bq_ddl_schema": ddl_schema,
         # Include ChaseSQL-specific constants.
@@ -83,72 +124,122 @@ def update_database_settings():
     return database_settings
 
 
+def _example_rows_ddl(client, table_ref):
+    """Optional: a few example rows for a table (best-effort, off by default)."""
+    try:
+        rows = client.list_rows(
+            table_ref, max_results=NUM_EXAMPLE_ROWS
+        ).to_dataframe()
+    except Exception:  # pragma: no cover - sampling is best-effort
+        return ""
+    if rows.empty:
+        return ""
+    out = f"-- Example values for table `{table_ref}`:\n"
+    for _, row in rows.iterrows():
+        values = []
+        for value in row.values:
+            if isinstance(value, str):
+                values.append(f"'{value}'")
+            elif value is None:
+                values.append("NULL")
+            else:
+                values.append(str(value))
+        out += f"INSERT INTO `{table_ref}` VALUES ({', '.join(values)});\n"
+    return out + "\n"
+
+
+def _ddl_for_dataset(client, project_id, dataset_id):
+    """Build DDL for every base table in one dataset using a single
+    INFORMATION_SCHEMA query instead of one API call per table. Cached for
+    SCHEMA_CACHE_TTL_SECONDS.
+    """
+    cached = _schema_cache.get(dataset_id)
+    if cached and (time.time() - cached[0]) < SCHEMA_CACHE_TTL_SECONDS:
+        return cached[1]
+
+    # One bulk query returns the columns of every base table in the dataset,
+    # replacing the previous O(tables) list_tables + get_table API calls.
+    query = f"""
+        SELECT c.table_name, c.column_name, c.data_type
+        FROM `{project_id}.{dataset_id}.INFORMATION_SCHEMA.COLUMNS` AS c
+        JOIN `{project_id}.{dataset_id}.INFORMATION_SCHEMA.TABLES` AS t
+          ON c.table_name = t.table_name
+        WHERE t.table_type = 'BASE TABLE'
+        ORDER BY c.table_name, c.ordinal_position
+    """
+    ddl_by_table: dict = {}
+    for row in client.query(query).result():
+        ddl_by_table.setdefault(row.table_name, []).append(
+            f"  `{row.column_name}` {row.data_type}"
+        )
+
+    ddl_statements = ""
+    for table_name, columns in ddl_by_table.items():
+        table_ref = f"{project_id}.{dataset_id}.{table_name}"
+        ddl_statements += (
+            f"CREATE OR REPLACE TABLE `{table_ref}` (\n"
+            + ",\n".join(columns)
+            + "\n);\n\n"
+        )
+        if INCLUDE_EXAMPLE_ROWS:
+            ddl_statements += _example_rows_ddl(client, table_ref)
+
+    _schema_cache[dataset_id] = (time.time(), ddl_statements)
+    return ddl_statements
+
+
 def get_bigquery_schema(dataset_id, client=None, project_id=None):
-    """Retrieves schema and generates DDL with example values for a BigQuery dataset.
+    """Retrieves schema and generates DDL for one or more BigQuery datasets.
 
     Args:
-        dataset_id (list): The IDs of the BigQuery dataset (e.g., ['my_dataset, 'second_dataset']).
+        dataset_id (list|str): One dataset id, or a list of dataset ids.
         client (bigquery.Client): A BigQuery client.
         project_id (str): The ID of your Google Cloud Project.
 
     Returns:
         str: A string containing the generated DDL statements.
     """
-
     if client is None:
         client = bigquery.Client(project=project_id)
-
-    # dataset_ref = client.dataset(dataset_id)
-    #dataset_ref = bigquery.DatasetReference(project_id, dataset_id)
+    if project_id is None:
+        project_id = client.project
+    if isinstance(dataset_id, str):
+        dataset_id = [dataset_id]
 
     ddl_statements = ""
-    for dataset_ids in dataset_id:
-        if dataset_ids != 'pso_ssm_usage':
-            dataset_ref = client.dataset(dataset_ids)
-            tables = list(client.list_tables(dataset_ref))
-
-            for table in tables:
-                table_ref = dataset_ref.table(table.table_id)
-                table_obj = client.get_table(table_ref)
-
-                # Check if table is a view
-                if table_obj.table_type != "TABLE":
-                    continue
-
-                ddl_statement = f"CREATE OR REPLACE TABLE `{table_ref}` (\n"
-
-                for field in table_obj.schema:
-                    ddl_statement += f"  `{field.name}` {field.field_type}"
-                    if field.mode == "REPEATED":
-                        ddl_statement += " ARRAY"
-                    if field.description:
-                        ddl_statement += f" COMMENT '{field.description}'"
-                    ddl_statement += ",\n"
-
-                ddl_statement = ddl_statement[:-2] + "\n);\n\n"
-
-                # Add example values if available (limited to first row)
-                rows = client.list_rows(table_ref, max_results=5).to_dataframe()
-                if not rows.empty:
-                    ddl_statement += f"-- Example values for table `{table_ref}`:\n"
-                    for _, row in rows.iterrows():  # Iterate over DataFrame rows
-                        ddl_statement += f"INSERT INTO `{table_ref}` VALUES\n"
-                        example_row_str = "("
-                        for value in row.values:  # Now row is a pandas Series and has values
-                            if isinstance(value, str):
-                                example_row_str += f"'{value}',"
-                            elif value is None:
-                                example_row_str += "NULL,"
-                            else:
-                                example_row_str += f"{value},"
-                        example_row_str = (
-                            example_row_str[:-1] + ");\n\n"
-                        )  # remove trailing comma
-                        ddl_statement += example_row_str
-
-                ddl_statements += ddl_statement
-
+    for ds in dataset_id:
+        ddl_statements += _ddl_for_dataset(client, project_id, ds)
     return ddl_statements
+
+
+def list_dataset_tables(dataset_id: str, tool_context: ToolContext) -> list:
+    """On-demand tool: list the base tables in a single dataset.
+
+    Part of the lazy / MCP-style retrieval path: rather than loading the whole
+    project's schema up front, the agent can discover tables for just the
+    dataset relevant to the current question.
+    """
+    client = get_bq_client()
+    return [t.table_id for t in client.list_tables(dataset_id)]
+
+
+def get_table_schema(dataset_id: str, table_id: str, tool_context: ToolContext) -> str:
+    """On-demand tool: return the DDL for a single table.
+
+    The scalable alternative to injecting every dataset's schema into the prompt:
+    the agent fetches only the schema it needs for the current question, keeping
+    context bounded regardless of warehouse size.
+    """
+    client = get_bq_client()
+    project_id = get_env_var("BQ_PROJECT_ID")
+    table_ref = f"{project_id}.{dataset_id}.{table_id}"
+    table_obj = client.get_table(table_ref)
+    columns = [f"  `{f.name}` {f.field_type}" for f in table_obj.schema]
+    return (
+        f"CREATE OR REPLACE TABLE `{table_ref}` (\n"
+        + ",\n".join(columns)
+        + "\n);\n"
+    )
 
 
 def initial_bq_nl2sql(
